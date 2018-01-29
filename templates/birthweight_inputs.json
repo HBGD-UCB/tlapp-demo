@@ -1,0 +1,64 @@
+{
+   "data":{
+      "uri": "https://git.ghap.io/stash/scm/hbgd-teams/UCB-SuperLearner.git",
+      "repository_path":"tlapp-demo/demo_data_iLiNS_subset.csv"
+   },
+   "nodes":{
+      "W":[
+         "SEX",
+         "GAGEBRTH",
+         "BIRTHLEN",
+         "birthorder",
+         "birthmonth",
+         "homedelivery",
+         "vagbirth",
+         "MHTCM",
+         "MWTKG",
+         "MBMI",
+         "MAGE",
+         "MEDUCYRS",
+         "single",
+         "breastfeeding",
+         "FHTCM",
+         "FAGE",
+         "FEDUCYRS",
+         "SES",
+         "NROOMS",
+         "NCOMP",
+         "NCHLDLT5",
+         "chicken",
+         "cow",
+         "improved.floor",
+         "improved.sanitation",
+         "safe.water",
+         "treat.water",
+         "SOAP",
+         "cleancook",
+         "DIARFL",
+         "DURBRST",
+         "month",
+         "tr",
+         "region"
+      ],
+      "A":[
+         "BIRTHWT"
+      ],
+      "Y":[
+         "HAZ"
+      ],
+      "exclude":[
+         "STUDYID",
+         "COUNTRY",
+         "SUBJID",
+         "AGEDAYS",
+         "stunt",
+         "sevstunt"
+      ]
+   },
+   "script_params":{
+      "parallelize": true,
+      "library_type": "comprehensive",
+      "baseline_category":3,
+      "num_treatment_categories":5
+   }
+}

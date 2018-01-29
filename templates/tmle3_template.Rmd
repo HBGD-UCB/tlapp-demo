@@ -1,0 +1,252 @@
+---
+title: "Multinomial TMLE for Treatment Specific Means and Average Treatment Effects"
+output: 
+  html_document:
+    standalone: true
+    self_contained: true
+required_packages:  ['knitr', 'igraph@1.0.1', 'github://jeremyrcoyle/sl3@tmle-demo-fixes', 'github://jeremyrcoyle/tmle3@conditional-densities', 'github://jeremyrcoyle/skimr@vector_types', 'Rsolnp', 'glmnet', 'xgboost', 'randomForest', 'future', 'ck37r',
+'github://jeremyrcoyle/delayed@reduce-r-version']
+params:
+  roles:
+    value:
+      - exclude
+      - W
+      - A
+      - Y
+  data: 
+    value: 
+      type: 'web'
+      uri: 'https://raw.githubusercontent.com/BerkeleyBiostats/tlapp/30821fe37d9fdb2cb645ad2c42f63f1c1644d7c4/cpp.csv'
+  nodes:
+    value:
+      W: ['apgar1', 'apgar5', 'gagebrth', 'mage', 'meducyrs', 'sexn']
+      A: ['parity']
+      Y: ['haz']
+  script_params:
+    value:
+      parallelize:
+        input: checkbox
+        value: TRUE
+      library_type:
+        input: select
+        value: 'comprehensive'
+        choices: ['mean', 'comprehensive']
+      num_treatment_categories:
+        input: 'numeric'
+        value: 5
+      baseline_category:
+        input: 'numeric'
+        value: 3
+  output_directory:
+    value: ''
+
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = FALSE, message=FALSE, eval.after = 'fig.cap')
+options(scipen=999)
+```
+
+```{r params, warning=FALSE}
+library(tltools)
+library(tmle3)
+library(sl3)
+library(ggplot2)
+library(skimr)
+data <- get_tl_data()
+nodes <- get_tl_nodes()
+library(future)
+tl_params <- get_tl_params()
+
+if(tl_params$parallelize){
+  
+  workers=availableCores()/2
+  plan(multicore, workers=workers)
+} else {
+  workers = 1
+  plan(sequential)
+}
+
+
+```
+
+
+## Data
+
+```{r data_summary, results="asis"}
+skim_format(.levels = list(max_char = 10))
+skim_list <- summarize_tmle_data(data, nodes)
+junk <- lapply(names(skim_list), function(variable_type){
+  cat(sprintf("\n**%s variables:**\n\n", stringr::str_to_title(variable_type)))
+  print(kable(skim_list[[variable_type]], row.names=FALSE))
+})
+
+```
+
+```{r preprocess_data}
+#todo: handle variable types better
+format_col <- function(col){
+  if(is.character(col)){
+    formatted <- as.numeric(as.factor(col))
+  } else {
+    formatted <- as.numeric(col)
+  }
+  
+  return(formatted)
+}
+data <- data[, lapply(.SD, format_col)]
+
+# handle missigness
+processed <- process_missing(data, nodes)
+data <- processed$data
+nodes <- processed$node_list
+
+discretize_variable(data, nodes$A, as.numeric(tl_params$num_treatment_categories))
+```
+
+```{r dropped_cols_text}
+if(length(processed$dropped_cols)>0){
+  dropped_cols_text <- sprintf(" We also dropped the following covariates due to high rates of missingness: %s.",
+                                paste(processed$dropped_cols, collapse=", "))
+} else{
+  dropped_cols_text <- ""
+}
+```
+
+We dropped `r processed$n_dropped` observations due to missingness in either the treatment or the outcome.`r dropped_cols_text`
+
+## Parameter
+
+We're interested in the causal parameters $E[Y_a]$ for all values of $a \in \mathcal{A}$. These parameters represent the mean outcome if, possibly contrary to fact, we intervened to set all units to have $A=a$. Under the randomization and positivity assumptions, these are identified by the statistical parameters $\psi_a=E_W[E_{Y|A,W}(Y|A=a,W)]$. We will estimate these parameters by using SuperLearner to fit the relevant likelihood factors -- $E_{Y|A,W}(Y|A=a,W)$ and $p(A=a|W)$, and then updating our likelihood fit using a joint TMLE. We will also estimate Average Treatment Effect (ATE) parameters for all levels of A relative to a prespecified baseline level using the delta method.
+
+## Likelihood Fits
+
+```{r define_learners}
+if(tl_params$library_type=="mean"){
+  qlib <- glib <- make_learner_stack("Lrnr_mean")
+} else{
+  #todo: some kind of clean SL wrapper fun (with defaults!)
+  qlib <- make_learner_stack("Lrnr_mean", 
+                             "Lrnr_glm_fast",
+                             "Lrnr_glmnet",
+                             list("Lrnr_xgboost", nthread=1))
+  
+  glib <- make_learner_stack("Lrnr_mean",
+                             "Lrnr_glmnet",
+                             list("Lrnr_xgboost", nthread=1))
+}
+
+
+# qlib <- glib <- make_learner_stack("Lrnr_mean")
+mn_metalearner <- make_learner(Lrnr_solnp, loss_function = loss_loglik_multinomial, learner_function = metalearner_linear_multinomial)
+metalearner <- make_learner(Lrnr_nnls)
+Q_learner <- make_learner(Lrnr_sl, qlib, metalearner)
+g_learner <- make_learner(Lrnr_sl, glib, mn_metalearner)
+
+learner_list <- list(Y=Q_learner, A=g_learner)
+```
+
+```{r fit_tmle}
+tmle_fit <- tmle3(tmle_tsm_all(), data, nodes, learner_list)
+
+# extract useful objects
+tmle_task <- tmle_fit$tmle_task
+likelihood <- tmle_fit$likelihood
+```
+
+We fit several likelihood factors using Super Learner as implemented in the [sl3 package](jeremyrcoyle.github.io/sl3/). We can assess the quality of these fits using cross-validated risk estimates:
+
+```{r inspect_fits}
+# todo: function to extract sl3 learner fits from likelihood object
+Q_fit <- likelihood$factor_list[["Y"]]$learner
+Q_risk <- Q_fit$cv_risk(loss_squared_error)
+g_fit <- likelihood$factor_list[["A"]]$learner
+g_risk <- g_fit$cv_risk(loss_loglik_multinomial)
+```
+
+#### Risk Estimates for `r sprintf("$%s$", density_formula(tmle_task, "Y"))`
+
+```{r q_fit}
+# todo: fix the label on this so it reflects what was actually fit
+kable(Q_risk)
+```
+
+#### Observed vs Predicted for `r sprintf("$%s$", density_formula(tmle_task, "Y"))`
+
+```{r q_pred_plot}
+prediction_plot(Q_fit)
+```
+
+#### Risk Estimates for `r sprintf("$%s$", density_formula(tmle_task, "A"))`
+```{r g_fit}
+kable(g_risk)
+```
+
+#### Observed vs Predicted for `r sprintf("$%s$", density_formula(tmle_task, "A"))`
+
+```{r g_pred_plot}
+prediction_plot(g_fit)
+```
+
+**NB:** currently the risk estimates for SuperLearner are optimistic in that they are cross-validated only on the learner fits, not on the metalearner fit. How important this is in practice has not been evaluated empircally. In addition, the standard errors should not be used for inference.
+
+
+### Positivity Assumption
+
+The positivity assumption (ETA) assumes that $p(A|W)>0 \,\forall \,A \in \mathcal{A}$ -- that is, there is some positive probability of observing each treatment in all strata of covariates. We can assess the plausability of this assumption by looking at our estimate of $p(A|W)$ obtained using Super Learner:
+
+#### Propensity Score Distributions
+```{r propensity_plot}
+  propensity_score_plot(likelihood, tmle_task, "A")
+```
+
+#### Propensity Score Quantiles
+```{r propensity_table}
+  kable(propensity_score_table(likelihood, tmle_task, "A"), 
+        digits=4)
+```
+
+If $p(A|W)$ has very small values for any level of A, you should be concerned about positivity violations. See [Diagnosing and responding to violations in the positivity assumption](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4107929/) for details about how to handle positivity issues.
+
+
+## TMLE Estimates
+
+Using the [tmle3 package](jeremyrcoyle.github.io/tmle3/), we updated our likelihood fits and estimated our parameters of interest (defined above).
+
+#### Treatment Specific Means
+```{r tmle_estimate_plot}
+  plot(tmle_fit)
+```
+
+#### Average Treatment Effects
+
+```{r contrasts}
+#todo: generalize delta method code
+baseline <- as.numeric(tl_params$baseline_category)
+others <- setdiff(seq_len(as.numeric(tl_params$num_treatment_categories)), baseline)
+estimates <- tmle_fit$estimates
+param_names <- tmle_fit$tmle_param_names
+contrasts <- lapply(others, function(contrast_level){
+  estimate <- delta_method(estimates[c(baseline,contrast_level)], f_contrast, f_contrast)
+  summary_from_estimate(estimate)
+})
+contrast_params <- sprintf("%s - %s", param_names[others], param_names[baseline])
+contrast_dt <- rbindlist(contrasts)
+contrast_dt$param <- contrast_params
+ggplot(contrast_dt, aes(y=param, x=tmle_est, xmin=lower, xmax=upper))+
+  geom_point()+geom_errorbarh()+theme_bw()+xlab("Value")+ylab("Parameter")
+```
+
+```{r save_tmle_summary}
+summary <- tmle_fit$summary
+summary_file <- file.path(params$output_directory, "tmle_summary.rdata")
+save(summary, file=summary_file)
+```
+
+## Processing Time
+```{r timings}
+kable(as.data.frame(tmle_fit$timings[, "elapsed"]), col.names = "Time (seconds)")
+```
+
+_Elapsed times for each step in seconds using `r workers` cores_
