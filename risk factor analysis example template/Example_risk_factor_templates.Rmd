@@ -1,0 +1,1421 @@
+---
+title: "Example risk factor analysis"
+output: html_notebook
+  code_folding: hide                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+---
+
+```{r, include=F}
+
+library(tidyverse)
+library(caret)
+library(tmle)
+#library(washb)
+
+source("C:/Users/andre/Dropbox/HBGDki figures/Example risk factor functions.R")
+```
+
+
+#Intro
+
+#Analysis step
+
+#Saved objects
+
+
+
+
+## Prelude: simulate mock data
+- would not be includeed in markdown template
+
+```{r}
+
+
+
+# Simulate data
+set.seed(12345)
+wast_inc<-rbinom(3000,1, 0.5) #Binomial outcome: wasting incidence
+WHZ<-rbinom(3000,1, 0.5) #Continious outcome: WHZ
+#Note: Some outcomes will be cross-sectional, like wasting and WHZ at child age 24 months
+#Some will be cumulative, aka any wasting 
+
+W<-data.frame(
+      W1=factor(rbinom(3000,1, 0.5)), #Binomial risk factor - set as factor variable
+      W2=rnorm(3000), #Continious risk factor
+      W3=as.factor(sample( LETTERS[1:4], 3000, replace=TRUE, prob=c(0.1, 0.2, 0.65, 0.05) )), #Categorical risk factor
+      W4=as.factor(sample( LETTERS[5:7], 3000, replace=TRUE, prob=c(0.25, 0.25, 0.5) ))) #Categorical risk factor
+
+STUDYID<-as.factor(c(rep(1,1000),rep(2,1000),rep(3,1000)))
+SUBJID<-1:3000
+COUNTRY<-rep("India", 3000)
+
+#Certain studies are missing risk factors. Simulate that here
+W$W1[STUDYID==2]<-NA
+W$W2[STUDYID==3]<-NA
+W$W3[STUDYID==1]<-NA
+W$W4[STUDYID==1]<-NA
+
+d<-data.frame(STUDYID, SUBJID, COUNTRY,wast_inc, WHZ,W)
+
+
+# Set reference levels if needed
+d$W3 <- relevel(d$W3, ref="A")
+d$W4 <- relevel(d$W4, ref="E")
+
+#Note that I will be loading in lots of data sets. Different markdown templates, or add datasets to list to loop through?
+
+
+#Impute missing with median/mode, and make indicator for imputed variables.
+#-Note, I'm open to better missing data imputation suggestions.
+
+
+#Impute overall median to create missingness indicator columns
+  missdf <- impute_missing_values(as.data.frame(d), type = "standard", add_indicators = T,prefix = "miss_", verbose = F)$data
+  
+  #add in missing indicator columns (but not imputed medians-we need study specific imputations)
+  d <- data.frame(d, missdf[,(ncol(d)+1):ncol(missdf)])
+
+
+  #Fill in study specific median for studies where a variable was measured (Note: doesn't do anything here because I haven't simulated any within-study partial missingness)
+  d<- d %>% group_by(STUDYID, COUNTRY) %>% 
+    do(as.data.frame(impute_missing_values(as.data.frame(.), type = "standard", add_indicators = F, verbose = F)$data))
+  
+  #Make sure d is a dataframe or my risk factor function won't work.
+  d <- as.data.frame(d)
+```
+
+# Longbow app
+
+-The app would start here, loading in a dataset of the following form:
+
+```{r, echo=F}
+knitr::kable(head(d))
+```
+
+
+The analysis consists of estimating relative risks between levels of a set of risk factors A and set of outcomes Y, both unadjusted and adjusted for other risk factors. Its functionally a variable importance analysis.
+
+Right now, I've set up the analysis to, within each analysis script, run all unadjusted and adjusted RR estimations between a set of all risk factors and a single outcome. Other parameters could be easily added to the analysis process (strata-specific adjusted means, population attributable fraction function).
+
+
+-Options for app:
+   - Pick single Y
+   - Pick a set of A
+   - Pick a W or list of W's (if each risk factor is adjusted for different other set of variables)
+   - Pick unadjusted, adjusted, or both
+   - Pick no subgroup, or a subgroup to stratify the analysis with
+   
+Output of app:
+   - Single dataframe of all estimated results
+   - markdown report with pooled summary plots, individual risk factor plots, printed results, any diagnostics
+   - Saved plot objects and saved results dataframe
+
+
+
+	2. Set Y, A, and W (and subgroup D)
+		a. Allow for vector of Y, A, W?
+			i. List of W if different W per A or Y (avoid any on the causal pathway)
+			ii. Right now, I'm median imputing W and making imputation flag indicators. Better way?
+			
+	3. Set reference level of A
+	4. Drop any imputed A
+	5. Get mean Y + 95% CI for each level of A
+	6. For each cohort (study + country), and each level of A, estimate RR compared to reference
+		a. If n_Y=1 is less than 5, don't estimate? 
+	7. Estimate PAF shifting distribution of A to A_ref
+	8. Create dataframe of results with the following columns:
+		a. Study 
+		b. Country
+		c. Outcome Y (name, not actual data)
+		d. Risk factor A
+		e. Level of A ("a")
+		f. N with A=a
+		g. Mean Y_A=a
+			i. CI for  Y_A=a (2 columns)
+		h. If continuous Y: ATE of E(Y_A=a) - E(Y_A=ref)
+			CI of ATE of E(Y_A=a) - E(Y_A=ref) (2 columns)
+		i. If binary Y:RR and RD of P(Y_A=a)/P(Y_A=ref) (2 columns)
+			i. CI of RR and RD of P(Y_A=a)/P(Y_A=ref) (4 columns)
+		j. PAF (NA for rows where level of A is not the reference level)
+			i. CI of PAF (2 columns)
+		k. If a binary outcome, columns for a, b, c, and d, from a 2x2 table (I.E. cases in comparison level, non-cases in comparison level, cases in reference level, non-cases in reference level).
+	9. If list of Y and/or A, repeat for all specified combinations of Y and A
+		a. Estimate unadjusted and adjusted
+	10. Clustered standard errors for recovery outcomes when there are repeated measures on 1 child (multiple cases of wasting). Better way to do this analysis?
+	11. Any SL/TMLE diagnostics?
+		a. Rules for adjusting when Y is sparse - only include a few covariates
+		b. Positivity diagnostics 
+	12. Sensitivity analyses (look at analysis plan - would these just be additional Y's?). 
+	13. Pool RR's and ATE's using both random and fixed effects meta-analyses (and overall SL?)
+	14. Let them know that the input dataset will be updating through the next couple of months,
+	15. Synapse code to post figures/results to synapse
+	16. Prioritizations for the output (generate the results first, then plots, etc.)
+		a. TMLE estimation of RR and PAF
+		b. Unadjusted output df
+		c. Adjusted output df
+		d. Subgroup analysis
+		e. Forest plots
+		f. Pooled analysis plots
+Shiny app
+
+
+### Set up parameters to run risk factor function across all risk factors for a single outcomes
+
+
+
+```{r}
+
+
+
+
+#set superlearner libraries
+unadjusted_lib <- "SL.glm"
+adjusted_lib <- c("SL.mean","SL.glm") #Would love eventual advice about good library to use for adjusted analysis
+
+
+#Make lists to hold results
+wastinc_024_unadj <- wastinc_024_adj <- WHZ_unadj  <- WHZ_adj <- list()
+
+
+
+#Set variables to exclude from adjustment set
+exclude_vars <- c("STUDYID","COUNTRY")
+
+
+
+
+
+#Set vector of factor or binary vars
+factor_vars <- c("W1","W3","W4")
+
+
+#Create a vector of reference levels for factor variables
+factor_reflevels<-c(1,3,1)
+
+
+#Set list of continious variables
+continious_vars <- c(
+  "W2")
+
+# Create vector indicating if quartiles  of continious variables
+# Should be based on the overall or study specific distribution
+# (Socio-economic variables are quartiled by study, while biological variables
+# are quartiled by overall distribution)
+overall_dist_vec <- c(T)
+
+```
+
+
+
+```{r}
+
+#----------------------------------
+# Run risk factor analysis for factor variables
+#----------------------------------
+
+
+for(i in 1:length(factor_vars)){
+  print(factor_vars[i])
+  Avar<-factor_vars[i]
+  A <- (d[,Avar])
+  n.cat <- length(levels(A))
+  Alevels<-levels(A)
+  Acuts <- c(1.5,2.5,3.5,4.5,5.5,6.5,7.5,8.5,9.5,10.5,11.5,12.5)[1:(length(Alevels)-1)] #Set numeric cutpoints between factor (for when its converted to numeric levels)
+  
+  table(A)
+  table(d[,paste0("miss_",Avar)])
+  
+  missing_var <- paste0("miss_",Avar)
+  
+  
+  #drop observations with missing risk factor
+  dsub <- d[d[,missing_var]==0,]
+  
+  #Make sure there is variation in the risk factor of interest in each study.
+  sddf <- dsub
+  colnames(sddf)[which(colnames(sddf) %in% Avar)] <- "A"
+  sddf <-sddf %>%  group_by(STUDYID, COUNTRY) %>% mutate(A=as.numeric(as.factor(A))) %>% summarize(mean=mean(A, na.rm=T), sd=sd(A, na.rm=T)) %>% filter(!is.na(sd) & sd!=0)
+  dsub <- dsub[paste0(dsub$STUDYID," ", dsub$COUNTRY) %in% paste0(sddf$STUDYID," ", sddf$COUNTRY),]
+  dsub <- dsub %>% mutate(w1=1, w2=1) %>% as.data.frame() #Generate empty covariates so function works in unadjusted analysis
+  
+  
+  wastinc_024_unadj[[paste0(Avar)]] <- dsub %>% group_by(STUDYID, COUNTRY) %>% select_groups() %>%
+    do(try(as.data.frame(  tmle_risk(dat=as.data.frame(.),
+                                         Y="wast_inc",
+                                         W=c("w1","w2"),
+                                         n.cat=n.cat,
+                                         A=Avar,
+                                         Acuts=Acuts,
+                                         Alevels=Alevels,
+                                         reflevel=1,
+                                         family="binomial",
+                                         SLlibrary=unadjusted_lib,
+                                         outputdf=NULL,
+                                         overall.dist=F,
+                                         sparseN=4,
+                                         adjusted=F)))) %>% as.data.frame()
+  
+  wastinc_024_adj[[paste0(Avar)]] <- dsub %>% group_by(STUDYID, COUNTRY) %>% select_groups() %>%
+    do(try(as.data.frame(  tmle_risk(dat=as.data.frame(.),
+                                         Y="wast_inc",
+                                         W=colnames(dsub)[which(!(colnames(dsub) %in% c(exclude_vars, Avar, paste0("miss_",Avar))))],
+                                         n.cat=n.cat,
+                                         A=Avar,
+                                         Acuts=Acuts,
+                                         Alevels=Alevels,
+                                         reflevel=1,
+                                         family="binomial",
+                                         SLlibrary=adjusted_lib,
+                                         outputdf=NULL,
+                                         overall.dist=F,
+                                         sparseN=4,
+                                         adjusted=T)))) %>% as.data.frame()
+}
+
+```
+
+
+### Format of the output
+
+Right now, I've set the unadjusted and adjusted results as seperate list objects 
+
+```{r}
+knitr::kable(head(wastinc_024_adj[[1]],10))
+```
+
+
+### Continious variables
+```{r}
+
+
+
+
+
+for(i in 1:length(continious_vars)){
+  print(continious_vars[i])
+  Avar<-continious_vars[i]
+  
+  overall_dist<-overall_dist_vec[i]
+  
+  table(d[,paste0("miss_",Avar)])
+  table(is.na(d[,paste0("miss_",Avar)]))
+  
+  table(d$STUDYID,d[,paste0("miss_",Avar)])
+  
+  missing_var <- paste0("miss_",Avar)
+  
+  #drop observations with missing risk factor
+  dsub <- d[d[,missing_var]==0,]
+  
+  #Make sure there is variation in the risk factor of interest in each study.
+  sddf <- dsub
+  colnames(sddf)[which(colnames(sddf) %in% Avar)] <- "A"
+  sddf <-sddf %>%  group_by(STUDYID, COUNTRY) %>% mutate(A=as.numeric(as.factor(A))) %>% summarize(mean=mean(A, na.rm=T), sd=sd(A, na.rm=T)) %>% filter(!is.na(sd) & sd!=0)
+  dsub <- dsub[paste0(dsub$STUDYID," ", dsub$COUNTRY) %in% paste0(sddf$STUDYID," ", sddf$COUNTRY),]
+  
+  dsub <- dsub %>% mutate(w1=1, w2=1) %>% as.data.frame()
+  dsub <- droplevels(dsub)
+  
+  if(overall_dist==T){
+    Acuts=quantile(dsub[,Avar], probs = c(.25,.5,.75), na.rm=T)
+    Alevels=c(paste0("<=",round(Acuts[1],3)), 
+              paste0(round(Acuts[1],3),"-",round(Acuts[2],3)),
+              paste0(round(Acuts[2],3),"-",round(Acuts[3],3)), 
+              paste0(">",round(Acuts[3],3))) 
+  }else{
+    Acuts=c(1.5,2.5,3.5)
+    Alevels=c("Q1","Q2","Q3","Q4")
+  }
+  
+  
+  wastinc_024_unadj[[paste0(Avar)]] <- dsub %>% group_by(STUDYID, COUNTRY) %>% select_groups() %>%
+    do(try(as.data.frame(  tmle_risk(dat=as.data.frame(.),
+                                         Y="wast_inc",
+                                         W=c("w1","w2"),
+                                         n.cat=4,
+                                         A=Avar,
+                                         Acuts=Acuts,
+                                         Alevels=Alevels,
+                                         reflevel=3,
+                                         family="binomial",
+                                         SLlibrary=unadjusted_lib,
+                                         outputdf=NULL,
+                                         overall.dist=overall_dist,
+                                         sparseN=4,
+                                         adjusted=F)))) %>% as.data.frame()
+  
+  wastinc_024_adj[[paste0(Avar)]] <- dsub %>% group_by(STUDYID, COUNTRY) %>% select_groups() %>%
+    do(try(as.data.frame(  tmle_risk(dat=as.data.frame(.),
+                                         Y="wast_inc",
+                                         W=colnames(dsub)[which(!(colnames(dsub) %in% c(exclude_vars, Avar, paste0("miss_",Avar))))],
+                                         n.cat=4,
+                                         A=Avar,
+                                         Acuts=Acuts,
+                                         Alevels=Alevels,
+                                         reflevel=1,
+                                         family="binomial",
+                                         SLlibrary=adjusted_lib,
+                                         outputdf=NULL,
+                                         overall.dist=overall_dist,
+                                         sparseN=4,
+                                         adjusted=T)))) %>% as.data.frame()
+}
+
+
+head(wastinc_024_unadj$W1)
+
+
+```
+
+
+### Wishlist to add to the above
+  - xxx
+  
+### Save objects  
+  
+```{r}
+
+
+#----------------------------------
+# Save objects
+#----------------------------------
+
+
+# save(wastinc_024_unadj, wastinc_024_adj, 
+#      file="x.Rdata")
+
+
+#Need to change the above to allow for stratification by a potential effect modifier
+
+
+#So now, for a single outcome, we have a dataframe of unadjusted means and RR for all risk factors of interest, and a dataframe
+# of means (currently unadjusted, could be replaced with adjusted) + adjusted RR's for all risk factors of interest
+
+#Below, we will generate the plots of interest for this outcome, but beyond what we've calculated here, we'll:
+    # -Need to add in PAF estimation
+    # Repeat for all Y
+    # Repeat for all age strata (0-6 months of age, 0-24 months of age, 6-24 months of age)
+    # All of the above repeated, stratified by a-priori effect modifiers
+    # Also repeat some of above for sensitivity analyses
+
+#-add code to make it easy to use a different W for each risk factor
+
+
+#Modular plots:
+#-make it easy to do a plot of all risk factors with a set outcome, or all outcomes and a single risk factor, or subset to a region, etc.
+
+#Two types of plots:
+   #-Forest plots of study-specific RR's from 1 Y and 1 A across all cohorts, as well as pooled RR's
+   # -Pooled RR plots, faceted across risk factors or outcomes
+
+#Maybe also print tables of the numbers underlying the forest plots
+
+#It may be easiest to set up a markdown report that estimate and saves results from one Y and age strata, and all risk factors (like above)
+#But I want a way to easily compile the results dataframes into a single dataframe with results from all Y, A, and age-strata and effect modifier subgroups.
+
+
+```
+
+```{r}
+
+
+#----------------------------------------------------
+# Plotting functions
+#----------------------------------------------------
+
+#Theme
+theme_set(theme_bw())
+
+#Forest plot Color palette
+cbPalette <- c( "#56B4E9" , rep("#999999",40))
+
+#hbgdki pallet
+tableau10 <- c("#1F77B4","#FF7F0E","#2CA02C","#D62728",
+  "#9467BD","#8C564B","#E377C2","#7F7F7F","#BCBD22","#17BECF")
+
+
+
+#----------------------------------------------------
+# Function to create fixed or random effects pooled RRs
+#----------------------------------------------------
+
+#Fit RE and FE models
+meta_fun <- function(res, method, reference=NULL){
+  
+  #ID reference level
+  levels<-levels(res$level)
+  res<-res[!is.na(res$logRR.var),]
+  if(is.null(reference)){
+    reference<- levels[!(levels %in% unique(res$level))]
+  }
+  require(metafor)
+  RMAest<-data.frame(study="Pooled estimate", res$variable[1],reference ,b=NA, se=NA)
+  colnames(RMAest)<-c("study","variable","level","logRR.psi","logSE")
+
+  for(j in 1:length(unique(res$level))){
+    temp<-res[res$level==unique(res$level)[j],]
+  fit<-rma(yi=logRR.psi, vi=logRR.var, data=temp, method=method, measure="RR")
+  est<-data.frame(study="Pooled estimate", temp$variable[1],temp$level[1] ,fit$b, fit$se)
+  colnames(est)<-c("study","variable","level","logRR.psi","logSE")
+  RMAest<-rbind(RMAest, est)
+  }
+  
+RMAest$RR<-exp(RMAest$logRR)
+RMAest$RR.CI1<-exp(RMAest$logRR - 1.96 * RMAest$logSE)
+RMAest$RR.CI2<-exp(RMAest$logRR + 1.96 * RMAest$logSE)
+
+#rename SE column to var just to allow binding to original results:
+#not used again in calculations
+colnames(RMAest)[5]<-"logRR.var"
+    return(RMAest)
+}
+
+
+
+
+
+#----------------------------------------------------
+# Clean results dfs function
+#----------------------------------------------------
+
+cleandf <- function(d, meta_method="REML", RF_levels=c("<=2600","2600-3000","3000-3400",">3400")){
+  
+  d$study <- d$STUDYID
+  d$country <- d$COUNTRY
+  
+  #remove grant identifier
+  d$study<- gsub("^k.*?-" , "", d$study)
+  
+  #create labels for country-specific cohorts
+  d$country <- as.character(d$country)
+  d$country[d$country=="TANZANIA, UNITED REPUBLIC OF"] <- "TANZANIA"
+  d$study <- paste0(d$study, " ", d$country)
+  
+  #drop studies with <5 cases in either reference or comparison level
+  d <- d %>% filter(is.na(b) | !(b<5 | d<5))
+  
+  d_meantab <- d %>% subset(.,select=c(study,meanLevel:meanY, mean.CI1, mean.CI2))
+  colnames(d_meantab) <- c("Study","Level", "Number in quartile", "Cumulative incidence of wasting", "95% CI-lower", "95% CI-upper")
+
+  d <- d %>% subset(.,select=c(study, variable, level, logRR.psi, logRR.var,
+                                               RR, RR.CI1, RR.CI2))
+  
+  #Estimate and merge in pooled RR's
+  d_RE<-meta_fun(d, method=meta_method)
+  d<-rbind(d_RE,d) %>% subset(., select=-c(logRR.psi,  logRR.var))
+
+  # Clean dataframes for plotting
+  #Sort levels/studies for plot
+  rankedRR <- d %>% group_by(study) %>% summarize(maxRR = max(RR, na.rm=T)) %>% arrange(maxRR)
+  rankedRR$order <- 1:nrow(rankedRR)
+  d <- left_join(d, rankedRR, by="study")
+  d$order[d$study=="Pooled estimate"] <- 1
+  
+  #Drop studies with no estimated RR and order by size of RR and arrange the dataframe
+  d$level <- factor(d$level, levels=RF_levels)
+  d <- d %>% filter(!(maxRR=="-Inf")) %>% arrange(order, level)
+  d$x<-1:nrow(d)
+  d$study <- factor(d$study , as.character(unique(d$study )))
+
+  return(d)
+}
+
+
+
+
+#----------------------------------------------------
+# RR Plot function
+#----------------------------------------------------
+RRplot_fun <- function(d, reflevel, title, units="", levels=NULL, free_Y=T){
+  
+  #change names of risk factor levels
+  if(!is.null(levels)){
+    d$level <- factor(as.numeric(d$level))
+    levels(d$level) <- levels
+  }
+  
+  #plot
+n <- nrow(d)
+
+plot_df <- d %>% filter(level!=reflevel)
+plot_df$size<-ifelse(plot_df$study=="Pooled estimate",1,0.5)
+
+RRplot<-ggplot(data=plot_df) + 
+  labs(title = d$variable, x = "Cohort", y = paste0("Risk ratio (reference = ",reflevel," ", units,")")) +
+  geom_hline(yintercept = 1) +
+  scale_y_continuous(breaks=c(0.125,0.25,0.5,1,2,4), trans='log10') +
+  coord_flip() +
+  scale_fill_manual(values=cbPalette) +
+  scale_colour_manual(values=cbPalette) +
+    scale_size_continuous(range = c(0.5, 1))+
+  geom_pointrange( mapping=aes(x=study, y=RR, ymin=RR.CI1, ymax=RR.CI2, colour=study, size=size)) +
+    theme(panel.border = element_blank(), 
+    strip.background = element_blank())
+
+if(free_Y){
+  RRplot<-RRplot + facet_wrap(~level, ncol=1, scales = "free_y") 
+}else{
+  RRplot<-RRplot + facet_wrap(~level, ncol=1) 
+}
+
+RRplot<-RRplot + geom_vline(xintercept=1.5, color="grey20", linetype=2) +
+   #geom_label(aes(label="Overall RR", x=1, y=6, size=.1)) + #Need to make smaller
+    ggtitle(title) +theme(legend.position="none")#+ guides(colour = guide_legend(reverse=T)) 
+return(RRplot)
+}
+
+
+
+```
+
+```{r}
+
+#----------------------------------------------------
+# Clean and plot risk factor results
+#----------------------------------------------------
+
+#Extract results for W2
+df <- wastinc_024_adj$W2
+
+#Function to format results df, setting the names of the levels
+#Right now, it just estimates a random effects pooled RR, 
+#but would be nice to add in and plot the fixed effects as well
+Anywast24mo <- cleandf(df, RF_levels=c("<=-0.676","-0.676-0.029","0.029-0.695",">0.695"))
+
+Anywast24mo_plot <-RRplot_fun(Anywast24mo, 
+                             reflevel="Q1", 
+                             title="Cumulative incidence ratios:\nAny wasting from 0-24 months age", 
+                             units="",
+                             levels = c("Q1","Q2","Q3","Q4"))
+Anywast24mo_plot
+
+
+```
+
+```{r}
+
+#-----------------------------------
+#Get pooled RR's for all risk factors
+# And print forest plots for all risk factors
+#-----------------------------------
+
+
+REpooled_wastinc024_unadj<-NULL
+for(i in 1:length(wastinc_024_unadj)){
+  if(nrow(wastinc_024_unadj[[i]])>0 & 
+     sum(is.na(wastinc_024_unadj[[i]]$RR),na.rm=T) != nrow(wastinc_024_unadj[[i]])
+    ){
+    
+    if(length(unique(wastinc_024_unadj[[i]]$meanLevel))>13){
+    plotlevels <- c("Q3", "Q1", "Q2", "Q4")  
+    wastinc_024_unadj[[i]]$meanLevel <- wastinc_024_unadj[[i]]$level <- rep(plotlevels, nrow(wastinc_024_unadj[[i]])/4)
+    wastinc_024_unadj[[i]]$level.order <- rep(c(3,1,2,4), nrow(wastinc_024_unadj[[i]])/4)
+    }else{
+    plotlevels <- unique(wastinc_024_unadj[[i]]$meanLevel)  
+    }
+                 
+  Anywast <- cleandf(wastinc_024_unadj[[i]], RF_levels=plotlevels)   #c("<=2700","2700-3000","3000-3400",">3400"))
+  Anywast_plot <-RRplot_fun(Anywast, 
+                               reflevel=wastinc_024_unadj[[i]]$level[1], 
+                               title=paste0("Risk factor: ",wastinc_024_unadj[[i]]$variable[1],"\nCumulative incidence ratios:\nAny wasting from 0-24 months age"), 
+                               units="",
+                               levels = unique(wastinc_024_unadj[[i]]$meanLevel))
+  print(Anywast_plot)
+  REpooled_wastinc024_unadj<-rbind(REpooled_wastinc024_unadj, Anywast[Anywast$study=="Pooled estimate",])
+  }
+}
+
+
+```
+
+```{r}
+
+#-----------------------------------
+# Plot pooled RR's
+#-----------------------------------
+
+
+
+#get RR range to offset (ref.) by a relative amount in plot
+plotdf <- REpooled_wastinc024_unadj %>% 
+              group_by(variable) %>% 
+              mutate(RRrange=diff(range(RR), na.rm=T),
+                     reflabel="")
+plotdf$reflabel[is.na(plotdf$RR)] <- "(ref.)"
+plotdf$RR[is.na(plotdf$RR)] <- 1
+
+#Pooled plot function
+scaleFUN <- function(x) sprintf("%.2f", x)
+
+RF_metaplot <- function(d, title="", yticks=c(0.5, 0.6, 0.7,0.8,0.9,1, 1/0.9, 1/0.8, 1/0.7, 1/0.6, 2)){
+
+  
+  
+p<-ggplot(d, aes(x=level)) + 
+  geom_point(aes(y=RR, fill=variable, color=variable), size = 4) +
+  geom_linerange(aes(ymin=RR.CI1, ymax=RR.CI2, color=variable),
+                 alpha=0.5, size = 3) +
+  geom_text(aes( y=0.95, label=reflabel, colour=variable)) +
+  labs(x = "Risk factor level", y = "Cumulative Incidence Ratio") +
+  geom_hline(yintercept = 1) +
+  coord_cartesian(ylim=c(0.7, 1/0.6)) +
+  scale_y_continuous(breaks=yticks, trans='log10', labels=scaleFUN) +
+  scale_fill_manual(values=rep(tableau10,4)) +
+  scale_colour_manual(values=rep(tableau10,4)) +
+  scale_size_continuous(range = c(0.5, 1))+
+  theme(strip.background = element_blank(),
+    legend.position="none",
+    strip.text.x = element_text(size=12),
+    axis.text.x = element_text(size=12)) +
+  facet_wrap(~variable,  scales = "free_x") +
+  ggtitle(title)
+
+return(p)
+}
+
+RF_metaplot(plotdf, title="Example risk factor pooled RR plots")
+
+
+#Save plots and data.frames 
+
+
+#-----------------------------------
+# Order of report
+#-----------------------------------
+
+# 1) table of N's and means by study and RF level
+# 2) Pooled RF plots
+# 3) any TMLE3 diagnostics
+# 4) Individual RF forest plots
+
+
+#-----------------------------------
+# List of desired changes from above
+#-----------------------------------
+
+
+
+
+
+```
+
+
+
+
+
+
+
+#Current set of analysis functions
+
+####Risk factor function
+
+Function to estimate ATE with TMLE across levels of a risk factor
+
+```{r}
+tmle_risk<-function(dat=d, 
+                    Y="HAZ", 
+                    W=Wvars, 
+                    n.cat=2, 
+                    A, 
+                    Acuts=NULL, 
+                    Alevels=NULL, 
+                    reflevel=NULL, 
+                    family="gaussian", 
+                    SLlibrary=library, 
+                    outputdf=res.df,
+                    overall.dist=T,
+                    sparseN=5,
+                    adjusted=F){
+  
+  #get number of studies 
+  nstudies<-length(unique(dat$STUDYID))
+  
+  if(A %in% W){W<-W[-which(W %in% A)]}
+  y<-subset(dat, select=Y)
+  a<-subset(dat, select=A)
+  dat$STUDYID<-as.factor(dat$STUDYID)
+  studyid<-subset(dat, select="STUDYID")
+  subjid<-subset(dat, select="SUBJID")
+  
+  #quartile and name levels if A is continious
+  if(overall.dist==F & class(a[,1])=="numeric"){
+    Acuts<-as.numeric(quantile(a[,1], probs = c((1:(n.cat-1))/n.cat), na.rm=T))
+    if(n.cat==2) Alevels<-c(paste0("<=",round(Acuts[1],3)),  paste0(">",round(Acuts[1],3)))
+    if(n.cat==3) Alevels<-c(paste0("<=",round(Acuts[1],3)), paste0(round(Acuts[1],3),"-",round(Acuts[2],3)), paste0(">",round(Acuts[2],3)))
+    if(n.cat==4) Alevels<-c(paste0("<=",round(Acuts[1],3)), paste0(round(Acuts[1],3),"-",round(Acuts[2],3)), paste0(round(Acuts[2],3),"-",round(Acuts[3],3)), paste0(">",round(Acuts[3],3)))
+  }
+  
+  #get reference and comparison levels
+  reference<-Alevels[reflevel]
+  comparisons<-Alevels[-reflevel]
+  
+  
+  summary(a[,1])
+  
+  table(findInterval(a[,1], Acuts, left.open=T))
+  
+  if(!is.null(Acuts)){
+    a[,1]<-findInterval(a[,1], Acuts, left.open=T)
+    a[,1]<-factor(a[,1])
+    if(!is.null(Alevels)){levels(a[,1])<-Alevels[as.numeric(levels(a[,1]))+1]}
+  }
+  
+  a[,1]<-as.factor(a[,1])
+  print(table(a[,1]))
+  
+  w<-subset(dat, select=c(W))
+    #remove sparse covariates
+  if(adjusted==T){
+    dim(w)
+    w <- w[ , colSums(is.na(w)) == 0]
+    #Drop factors with no variation
+    w<-droplevels(w)
+    w <- w[, sapply(w, nlevels) > 1 | sapply(w, is.numeric)]
+    preproc = caret::preProcess(w, method = c("zv", "nzv"))
+    w = predict(preproc, w)
+    dim(w)
+    print(colnames(w))
+  }
+
+  
+  
+  fulldat<-data.frame(y,a,studyid,subjid,w)
+  fulldat<-fulldat[complete.cases(fulldat),]
+  
+  #Extract mean Y|A
+  levelmeans<- fulldat %>% #fulldat[fulldat[,2]==levels(fulldat[,2])[1],] %>%
+    group_by(.[[2]]) %>%
+    do(as.data.frame(washb_mean(Y=.[[1]], id=1:length(.[[1]]), print = F))) %>% 
+    as.data.frame %>% `rownames<-`(.[,1]) #%>% .[,-1]
+  
+  
+  #Extract desired levels
+  levelmeans<-levelmeans[1:n.cat,]
+  
+
+#Code for TMLE3
+  
+  #NOTE: Make sure I'm feeding in a factor, not numeric A, for the multinomial
+  
+  # nodes <- list(W=colnames(w),
+  #               A=A,
+  #               Y=Y)
+  # 
+  # lrnr_glm_fast <- make_learner(Lrnr_glm_fast)
+  # lrnr_mean <- make_learner(Lrnr_mean)
+  # learner_list <- list(Y=lrnr_mean, A=lrnr_glm_fast)
+  # 
+  # d<- data.table(fulldat)
+  # tmle_fit_from_spec <- tmle3(tmle_TSM_all(),d, nodes, learner_list)
+  # print(tmle_fit_from_spec)
+  # 
+  # tmle_fit_from_spec$summary
+  # tmle_fit_from_spec$delta_summary
+  # 
+  # 
+  #   
+  # tmle_fit_PAF <- tmle3(tmle_PAR(baseline_level = 0),d, nodes, learner_list)
+  # print(tmle_fit_PAF)
+  # tmle_fit_PAF$delta_summary
+
+  
+  res<-NULL
+  for(i in comparisons){
+
+    dat<-fulldat[fulldat[,2]==reference | fulldat[,2]==i,]
+    # print(table(dat[,2], dat[,1]))
+
+    print(table(dat[,2]))
+
+    #Convert factor to binary indicator
+    dat[,2]<-ifelse(dat[,2]==reference,0,1)
+
+    table(dat[,1],dat[,2])
+    if(family=="binomial"){print(c(table(dat[,1],dat[,2])))}
+    sparse=F
+    if(family=="binomial"){
+      tab<-c(table(dat[,1],dat[,2]))
+      if(tab[1]<sparseN+1 | tab[2]<sparseN+1  | tab[3]<sparseN+1  | tab[4]<sparseN+1 | is.na(tab[1]) | is.na(tab[2]) | is.na(tab[3]) | is.na(tab[4])){
+        sparse=T
+      }
+    }
+
+
+
+    if(sum(dat[,2]==0)>sparseN & sum(dat[,2]==1)>sparseN & sparse==F){ #Make sure there is enough support in the data
+      w<-as.data.frame(dat[,5:ncol(dat)])
+      if(ncol(w)==1){colnames(w)<-colnames(dat)[5]<-"colW"}
+
+      if(adjusted==T){
+        if(family=="binomial"){
+          Wscreen <- hbgdki_prescreen(Y=dat[,1], Ws=droplevels(w), ncases=sum(dat[,1]))
+          }else{
+            Wscreen <- washb_prescreen(Y=dat[,1], Ws=droplevels(w))
+            }
+        if(length(Wscreen)>0){
+        w<-subset(w, select=Wscreen)
+        }else{
+          dat$w1<-rep(1, nrow(dat))
+          dat$w2<-rep(1, nrow(dat))
+          w<-data.frame(w1=dat$w1, w2=dat$w2)
+        }
+        if(length(Wscreen)==1){ #add null covariate so glmnet works
+        dat$w2 <- w$w2 <- rep(1, nrow(dat))
+        }
+      }
+
+      fit<-studyCV.tmle(d=dat,
+                        Y=Y,
+                        Avar=A,
+                        nstudies=nstudies,
+                        lib=SLlibrary,
+                        family=family,
+                        Wvars=colnames(w),
+                        CVstudies=ifelse(nstudies==1,F,T))
+
+      out<-as.data.frame(fit)
+      names(out)<-i
+      out<-t(out)
+      out<-data.frame(A,i,out,reference,compN=sum(dat[,2]==0), refN=sum(dat[,2]==1))
+
+      if(family=="binomial"){
+        out<-data.frame(out,t(c(table(dat[,1],dat[,2]))))
+        colnames(out)<-c("variable","level","psi","var.psi","CI1","CI2","pvalue","RR", "RRCI1", "RRCI2","RRpvalue","log.RR","var.log.RR", "reference", "compN", "refN","d","c","b","a")
+      }else{
+        colnames(out)<-c("variable","level","psi","var.psi","CI1","CI2","pvalue", "reference", "compN", "refN")
+      }
+
+
+    }else{
+      if(family=="binomial"){
+        out<-data.frame(variable=A,level=i,psi=NA, var.psi=NA, CI1=NA, CI2=NA, pvalue=NA, RR=NA,  RRCI1=NA, RRCI2=NA, RRpvalue=NA, log.RR=NA, var.log.RR=NA, reference=reference, compN=sum(dat[,2]==0), refN=sum(dat[,2]==1), d=tab[1], c=tab[2], b=tab[3], a=tab[4])
+
+      }else{
+        out<-data.frame(variable=A,level=i,psi=NA, var.psi=NA, CI1=NA, CI2=NA, pvalue=NA, reference=reference, compN=sum(dat[,2]==0), refN=sum(dat[,2]==1))
+      }
+      rownames(out)<-i
+    }
+    res<-rbind(res,out)
+  }
+
+  
+  if(family=="binomial"){
+    refrow<-data.frame(res[1,1],reference,t(rep(NA,11)),reference,t(rep(NA,6)))
+  }else{
+    refrow<-data.frame(res[1,1],reference,t(rep(NA,5)),reference,t(rep(NA,2)))
+  }
+  colnames(refrow)<-colnames(res)
+  res<-rbind(refrow,res)
+  
+  res<-cbind(res,levelmeans)
+  
+  if(family=="binomial"){
+    colnames(res)<-c("variable","level","ATE","ATE.var","ATE.CI1","ATE.CI2", "ATE.Pval","RR","RR.CI1","RR.CI2", "RR.Pval", "logRR.psi","logRR.var","reference", "compN", "refN","a","b","c","d", "meanLevel", "meanN",
+                     "meanY", "mean.sd","mean.se","mean.CI1","mean.CI2")
+  }else{
+    colnames(res)<-c("variable","level","ATE","var","CI1","CI2", "Pval","reference", "compN", "refN", "meanLevel", "meanN",
+                     "meanY", "mean.sd","mean.se","mean.CI1","mean.CI2")
+  }
+  rownames(res)<-NULL
+
+  
+  if(!is.null(outputdf)){
+    return(rbind(outputdf,res))
+  }else{
+    #return(list(res=res, PAFdat=PAFdat))
+    return(res)
+  }
+}
+
+```
+
+
+####TMLE wrapper function
+
+Most of this function is currently extraneous; it was coded to do a TMLE across all studies, with cross validation set up to create folds with equal proportions of each study. Currently, we are only estimating RR's and ATE's within studies, and then pooling across studies with random effects models. As currently used, it just runs tmle() and returns the ATE or RR and confidence intervals.
+
+```{r, include=FALSE}
+
+
+
+
+studyCV.tmle<-function(d, 
+                       Y,
+                       Avar, 
+                       nstudies,
+                       lib=lib, 
+                       Wvars,
+                       family,
+                       CVstudies=T){
+  
+  set.seed(12345)
+  d<-as.data.frame(d)
+  Y<-subset(d, select=Y)
+  subjid<-subset(d, select="SUBJID")
+  W<-subset(d, select=Wvars)
+  W<-design_matrix(as.data.frame(W))
+  
+  if(nstudies>1){
+    
+    mixed.CVfolds<-createFolds(factor(d$STUDYID), k = 5, list = TRUE)
+    
+    
+    X<-cbind(d[,Avar], W)
+    colnames(X)[1]<-Avar
+    Qsl<-SuperLearner(Y=Y[,1],
+                      #X=cbind(d[,Avar], subset(d, select=Wvars)),
+                      X=X,
+                      SL.library = lib,
+                      family=family,
+                      cvControl = ifelse(CVstudies==T,
+                                         list(V=5, validRows=mixed.CVfolds),
+                                         list(V=5)))
+    dY1<-dY0<-as.data.frame(X)
+    dY1[,Avar]<-1
+    dY0[,Avar]<-0
+    Q<-cbind(predict(Qsl, newdata = dY1)$pred,predict(Qsl, newdata = dY0)$pred)
+    head(Q)
+    
+    
+    gsl<-SuperLearner(Y=subset(d, select=Avar)[,1],
+                      X=X[,-1],
+                      SL.library = lib,
+                      family=family,
+                      cvControl = ifelse(CVstudies==T,
+                                         list(V=5, validRows=mixed.CVfolds),
+                                         list(V=5)))
+    
+    g1W<-predict(gsl)$pred
+    
+    
+    
+    suppressWarnings(mixedCV.tmle.A<-tmle(Y=Y[,1], 
+                         A=subset(d, select=Avar)[,1], 
+                         W=X[,-1], 
+                         Q=Q,
+                         g1W=g1W,
+                         family = family, 
+                         verbose = F))
+    
+  }else{
+    suppressWarnings(mixedCV.tmle.A<-tmle(Y=Y[,1], 
+                         A=subset(d, select=Avar)[,1], 
+                         W=W, 
+                         family = family, 
+                         Q.SL.library=lib,
+                         g.SL.library = lib,
+                         verbose = F,
+                         id=subjid[,1]))  
+    
+  }
+  if(family=="binomial"){
+    return(c(unlist(mixedCV.tmle.A$estimates$ATE),unlist(mixedCV.tmle.A$estimates$RR)))
+  }else{
+    return(unlist(mixedCV.tmle.A$estimates$ATE))
+  }
+}
+
+```
+
+
+####Function to facilitate binding out risk factor analysis output across dplyr groups
+```{r}
+select_groups <- function(data, groups, ...) {
+  data[sort(unlist(attr(data, "indices")[ groups ])) + 1, ]}
+
+```
+
+
+#### Function to prescreen covariates via LR test p-value and  select 1 covariate per 10 cases
+
+Wasting is rare in many studies so we worry about positivity violations if  we adjust for too many covariates. Easiest way to handle this is to impose a certian number of Y==1 outcomes per convariate included. This function estimates a likelihood ratio p-value for each bivariate Y-W_i associations, rank order W by p-values, and then chooses (Y==1)/10 W's with the highest p-values.
+
+I
+
+```{r}
+hbgdki_prescreen <- function (Y, Ws, ncases, family = "binomial", pval = 0.2,  print = TRUE){
+  
+   n<-nrow(Ws)
+   if(n-ncases < ncases){ncases<-n-ncases}  
+  
+    require(lmtest)
+    if(family[[1]]=="neg.binom"){
+       require(MASS)
+    }
+    if(pval > 0.99 | pval < 0){
+        stop("P-value threshold not set between 0 and 1.")
+    }
+    Ws <- as.data.frame(Ws)
+    dat <- data.frame(Ws, Y)
+    dat <- dat[complete.cases(dat), ]
+    nW <- ncol(Ws)
+    LRp <- matrix(rep(NA, nW), nrow = nW, ncol = 1)
+    rownames(LRp) <- names(Ws)
+    colnames(LRp) <- "P-value"
+    if(family[[1]] != "neg.binom"){
+        for(i in 1:nW) {
+            dat$W <- dat[, i]
+            if(class(dat$W) == "factor" & dim(table(dat$W)) == 
+                1) {
+                fit1 <- fit0 <- glm(Y ~ 1, data = dat, family = family)
+            }
+            else{
+                fit1 <- glm(Y ~ W, data = dat, family = family)
+                fit0 <- glm(Y ~ 1, data = dat, family = family)
+            }
+            LRp[i] <- lrtest(fit1, fit0)[2, 5]
+        }
+    }
+    else{
+        if(!requireNamespace("MASS", quietly = TRUE)){
+            stop("Pkg needed forthis function to work. Please install it.", 
+                call. = FALSE)
+        }
+        else{
+            for(i in 1:nW){
+                dat$W <- dat[, i]
+                if(class(dat$W) == "factor" & dim(table(dat$W)) == 
+                  1) {
+                  fit1 <- fit0 <- glm(Y ~ 1, data = dat, family = family)
+                }
+                else{
+                  fit1 <- glm.nb(Y ~ W, data = dat, family = family)
+                  fit0 <- glm.nb(Y ~ 1, data = dat, family = family)
+                }
+                LRp[i] <- lrtest(fit1, fit0)[2, 5]
+            }
+        }
+    }
+    p20 <- ifelse(LRp < pval, 1, 0)
+    if(print == TRUE) {
+        cat("\nLikelihood Ratio Test P-values:\n")
+        print(round(LRp, 5))
+        if(sum(p20) > 0) {
+            LRps <- matrix(LRp[p20 == 1, ], ncol = 1)
+            rownames(LRps) <- names(Ws)[p20 == 1]
+            colnames(LRps) <- "P-value"
+            cat(paste("\n\nCovariates selected (P<", pval, "):\n", 
+                sep = ""))
+            print(LRps)
+        }
+        else{
+            cat(paste("\nNo covariates were associated with the outcome at P<", 
+                pval))
+        }
+    }
+    
+    W <- data.frame(wvar=names(Ws), p=as.numeric(LRp), pthres=as.numeric(p20))
+    if(floor(ncases/10) > 0){
+    W <- W %>% arrange(p) %>% slice(1:floor(ncases/10))
+    }else{
+      W$pthres = 0
+      cat("\nNot enough cases for adjusted analysis")
+    }
+    return(as.character(W$wvar[W$pthres == 1]))
+}
+
+```
+
+
+
+#### Function to impute missingness function
+-adapted from Chris Kenedy's ck37 package 
+
+```{r}
+
+Mode<-function(x){
+  ux = unique(x)
+  tab = tabulate(match(x, ux))
+  ux[tab == max(tab)]
+}
+
+missingness_indicators<-function (data, prefix = "miss_", remove_constant = T, remove_collinear = T, 
+                                  skip_vars = c(), verbose = F) {
+  indicators = sapply(data[, !colnames(data) %in% skip_vars], 
+                      FUN = function(col) as.numeric(is.na(col)))
+  colnames(indicators) = paste0(prefix, colnames(data)[!colnames(data) %in% 
+                                                         skip_vars])
+  if (remove_constant) {
+    col_means = colMeans(indicators)
+    if (verbose) {
+      num_removed = sum(col_means %in% c(0, 1))
+      if (num_removed > 0) {
+        cat("Removing", num_removed, "indicators that are constant.\n")
+      }
+    }
+    indicators = indicators[, !col_means %in% c(0, 1), drop = F]
+  }
+  if (remove_collinear) {
+    linear_combos = caret::findLinearCombos(indicators)
+    remove_columns = linear_combos$remove
+    if (length(linear_combos$remove) > 0) {
+      if (verbose) {
+        cat("Removing", length(linear_combos$remove), 
+            "indicators due to collinearity:\n")
+        cat(paste0(colnames(indicators)[linear_combos$remove], 
+                   collapse = ", "), "\n")
+      }
+      indicators = indicators[, -linear_combos$remove, 
+                              drop = F]
+    }
+  }
+  return(indicators)
+}
+
+
+
+
+impute_missing_values<-function(data, type = "standard", add_indicators = T, prefix = "miss_", skip_vars = c(), verbose = F){
+  missing_indicators = NULL
+  new_data = data
+  results = list(type = type, add_indicators = add_indicators, 
+                 skip_vars = skip_vars, prefix = prefix)
+  if (type == "standard") {
+    if (verbose) {
+      cat("Running standard imputation.\n")
+    }
+    preprocess = NA
+    impute_values = vector("list", ncol(data))
+    names(impute_values) = colnames(data)
+    for (i in 1:ncol(data)) {
+      nas = sum(is.na(data[[i]]))
+      col_class = class(data[[i]])
+      if (col_class == "factor") {
+        impute_value = Mode(data[[i]])[1]
+      }
+      else if (col_class %in% c("integer", "numeric")) {
+        impute_value = median(data[[i]], na.rm = T)
+      }
+      else {
+        warning(paste(colnames(data)[i], "should be numeric or factor type. But its class is", 
+                      col_class))
+      }
+      impute_values[[i]] = impute_value
+      if (nas == 0 || names(data)[i] %in% skip_vars) {
+        next
+      }
+      else if (nas == nrow(data)) {
+        if (verbose) {
+          cat("Note: skipping", colnames(data)[i], "because all values are NA.\n")
+        }
+        next
+      }
+      else {
+        new_data[is.na(data[[i]]), i] = impute_value
+      }
+    }
+    results$impute_values = impute_values
+  }
+  else if (type == "knn") {
+    impute_info = caret::preProcess(new_data, method = c("knnImpute"))
+    new_data = predict(impute_info, new_data)
+    results$impute_info = impute_info
+  }
+  if (add_indicators) {
+    missing_indicators = missingness_indicators(data, prefix = prefix, 
+                                                verbose = verbose)
+    if (verbose) {
+      cat("Indicators added:", ncol(missing_indicators), 
+          "\n")
+    }
+    new_data = cbind(new_data, missing_indicators)
+  }
+  results$data = new_data
+  return(results)
+}
+
+
+```
+
+
+
+# Current set of plotting functions
+
+
+```{r}
+
+
+
+#----------------------------------------------------
+# Function to create fixed or random effects pooled RRs
+#----------------------------------------------------
+
+#Fit RE and FE models
+meta_fun <- function(res, method, reference=NULL){
+  
+  #ID reference level
+  levels<-levels(res$level)
+  res<-res[!is.na(res$logRR.var),]
+  if(is.null(reference)){
+    reference<- levels[!(levels %in% unique(res$level))]
+  }
+  require(metafor)
+  RMAest<-data.frame(study="Pooled estimate", res$variable[1],reference ,b=NA, se=NA)
+  colnames(RMAest)<-c("study","variable","level","logRR.psi","logSE")
+
+  for(j in 1:length(unique(res$level))){
+    temp<-res[res$level==unique(res$level)[j],]
+  fit<-rma(yi=logRR.psi, vi=logRR.var, data=temp, method=method, measure="RR")
+  est<-data.frame(study="Pooled estimate", temp$variable[1],temp$level[1] ,fit$b, fit$se)
+  colnames(est)<-c("study","variable","level","logRR.psi","logSE")
+  RMAest<-rbind(RMAest, est)
+  }
+  
+RMAest$RR<-exp(RMAest$logRR)
+RMAest$RR.CI1<-exp(RMAest$logRR - 1.96 * RMAest$logSE)
+RMAest$RR.CI2<-exp(RMAest$logRR + 1.96 * RMAest$logSE)
+
+#rename SE column to var just to allow binding to original results:
+#not used again in calculations
+colnames(RMAest)[5]<-"logRR.var"
+    return(RMAest)
+}
+
+
+
+
+
+#----------------------------------------------------
+# Clean results dfs function
+#----------------------------------------------------
+
+cleandf <- function(d, meta_method="REML", RF_levels=c("<=2600","2600-3000","3000-3400",">3400")){
+  
+  d$study <- d$STUDYID
+  d$country <- d$COUNTRY
+  
+  #remove grant identifier
+  d$study<- gsub("^k.*?-" , "", d$study)
+  
+  #create labels for country-specific cohorts
+  d$country <- as.character(d$country)
+  d$country[d$country=="TANZANIA, UNITED REPUBLIC OF"] <- "TANZANIA"
+  d$study <- paste0(d$study, " ", d$country)
+  
+  #drop studies with <5 cases in either reference or comparison level
+  d <- d %>% filter(is.na(b) | !(b<5 | d<5))
+  
+  d_meantab <- d %>% subset(.,select=c(study,meanLevel:meanY, mean.CI1, mean.CI2))
+  colnames(d_meantab) <- c("Study","Level", "Number in quartile", "Cumulative incidence of wasting", "95% CI-lower", "95% CI-upper")
+
+  d <- d %>% subset(.,select=c(study, variable, level, logRR.psi, logRR.var,
+                                               RR, RR.CI1, RR.CI2))
+  
+  #Estimate and merge in pooled RR's
+  d_RE<-meta_fun(d, method=meta_method)
+  d<-rbind(d_RE,d) %>% subset(., select=-c(logRR.psi,  logRR.var))
+
+  # Clean dataframes for plotting
+  #Sort levels/studies for plot
+  rankedRR <- d %>% group_by(study) %>% summarize(maxRR = max(RR, na.rm=T)) %>% arrange(maxRR)
+  rankedRR$order <- 1:nrow(rankedRR)
+  d <- left_join(d, rankedRR, by="study")
+  d$order[d$study=="Pooled estimate"] <- 1
+  
+  #Drop studies with no estimated RR and order by size of RR and arrange the dataframe
+  d$level <- factor(d$level, levels=RF_levels)
+  d <- d %>% filter(!(maxRR=="-Inf")) %>% arrange(order, level)
+  d$x<-1:nrow(d)
+  d$study <- factor(d$study , as.character(unique(d$study )))
+
+  return(d)
+}
+
+
+
+
+
+
+
+```
+
+
+
+
+```{r}
+
+#----------------------------------------------------
+# RR Plot function
+#----------------------------------------------------
+
+
+RRplot_fun <- function(d, reflevel, title, units="", levels=NULL, free_Y=T){
+
+
+#get RR range to offset (ref.) by a relative amount in plot
+plotdf <- REpooled_wastinc024_unadj %>% 
+              group_by(variable) %>% 
+              mutate(RRrange=diff(range(RR), na.rm=T),
+                     reflabel="")
+plotdf$reflabel[is.na(plotdf$RR)] <- "(ref.)"
+plotdf$RR[is.na(plotdf$RR)] <- 1
+
+#Pooled plot function{
+  
+  #change names of risk factor levels
+  if(!is.null(levels)){
+    d$level <- factor(as.numeric(d$level))
+  }
+  
+  #plot
+n <- nrow(d)
+    levels(d$level) <- levels
+
+plot_df <- d %>% filter(level!=reflevel)
+plot_df$size<-ifelse(plot_df$study=="Pooled estimate",1,0.5)
+
+RRplot<-ggplot(data=plot_df) + 
+  labs(title = d$variable, x = "Cohort", y = paste0("Risk ratio (reference = ",reflevel," ", units,")")) +
+  geom_hline(yintercept = 1) +
+  scale_y_continuous(breaks=c(0.125,0.25,0.5,1,2,4), trans='log10') +
+  coord_flip() +
+  scale_fill_manual(values=cbPalette) +
+  scale_colour_manual(values=cbPalette) +
+    scale_size_continuous(range = c(0.5, 1))+
+  geom_pointrange( mapping=aes(x=study, y=RR, ymin=RR.CI1, ymax=RR.CI2, colour=study, size=size)) +
+    theme(panel.border = element_blank(), 
+    strip.background = element_blank())
+
+if(free_Y){
+  RRplot<-RRplot + facet_wrap(~level, ncol=1, scales = "free_y") 
+}else{
+  RRplot<-RRplot + facet_wrap(~level, ncol=1) 
+}
+
+RRplot<-RRplot + geom_vline(xintercept=1.5, color="grey20", linetype=2) +
+   #geom_label(aes(label="Overall RR", x=1, y=6, size=.1)) + #Need to make smaller
+    ggtitle(title) +theme(legend.position="none")#+ guides(colour = guide_legend(reverse=T)) 
+return(RRplot)
+}
+scaleFUN <- function(x) sprintf("%.2f", x)
+
+RF_metaplot <- function(d, title="", yticks=c(0.5, 0.6, 0.7,0.8,0.9,1, 1/0.9, 1/0.8, 1/0.7, 1/0.6, 2)){
+  
+p<-ggplot(d, aes(x=level)) + 
+  geom_point(aes(y=RR, fill=variable, color=variable), size = 4) +
+  geom_linerange(aes(ymin=RR.CI1, ymax=RR.CI2, color=variable),
+                 alpha=0.5, size = 3) +
+  geom_text(aes( y=0.95, label=reflabel, colour=variable)) +
+  labs(x = "Risk factor level", y = "Cumulative Incidence Ratio") +
+  geom_hline(yintercept = 1) +
+  coord_cartesian(ylim=c(0.7, 1/0.6)) +
+  scale_y_continuous(breaks=yticks, trans='log10', labels=scaleFUN) +
+  scale_fill_manual(values=rep(tableau10,4)) +
+  scale_colour_manual(values=rep(tableau10,4)) +
+  scale_size_continuous(range = c(0.5, 1))+
+  theme(strip.background = element_blank(),
+    legend.position="none",
+    strip.text.x = element_text(size=12),
+    axis.text.x = element_text(size=12)) +
+  facet_wrap(~variable,  scales = "free_x") +
+  ggtitle(title)
+
+return(p)
+}
+
+
+
+
+
+
+```
+
